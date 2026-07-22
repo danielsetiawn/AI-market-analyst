@@ -9,13 +9,25 @@ from core.confluence import evaluate_confluence
 
 def run_backtest(
     data: pd.DataFrame,
-    min_agree: int = 2,
+    min_agree: float = 1.5,
     fee_pct: float = 0.001,
     slippage_pct: float = 0.001,
     warmup: int = 50,
     stop_loss_pct: float = 0.03,
-    take_profit_pct: float = 0.06,
+    trailing_activation_pct: float = 0.05,
+    trailing_stop_pct: float = 0.04,
 ) -> dict:
+    """
+    Exit logic sekarang:
+    1. Fixed stop-loss (-stop_loss_pct dari entry) - proteksi awal.
+    2. Begitu profit >= trailing_activation_pct, switch ke trailing stop:
+       exit kalau harga turun trailing_stop_pct dari titik TERTINGGI
+       yang pernah dicapai posisi ini (bukan dari entry lagi).
+       Ini yang bikin posisi bisa "ikut" rally panjang, gak kepotong
+       di target tetap kayak take-profit lama.
+    3. Confluence SELL tetap jadi exit alternatif kalau dua di atas
+       belum kena.
+    """
     position = None
     trades = []
     equity = 1.0
@@ -25,16 +37,20 @@ def run_backtest(
         window = data.iloc[: i + 1]
         today = window.iloc[-1]
 
-        # --- Cek stop-loss / take-profit DULU, sebelum tanya confluence ---
         if position is not None:
             current_price = today["Close"]
-            change_pct = (current_price - position["entry_price"]) / position["entry_price"]
+
+            if current_price > position["highest_price"]:
+                position["highest_price"] = current_price
+
+            change_from_entry = (current_price - position["entry_price"]) / position["entry_price"]
+            change_from_peak = (current_price - position["highest_price"]) / position["highest_price"]
 
             forced_exit_reason = None
-            if change_pct <= -stop_loss_pct:
+            if change_from_entry <= -stop_loss_pct:
                 forced_exit_reason = "stop_loss"
-            elif change_pct >= take_profit_pct:
-                forced_exit_reason = "take_profit"
+            elif change_from_entry >= trailing_activation_pct and change_from_peak <= -trailing_stop_pct:
+                forced_exit_reason = "trailing_stop"
 
             if forced_exit_reason:
                 exit_price = current_price * (1 - slippage_pct)
@@ -50,14 +66,18 @@ def run_backtest(
                 })
                 position = None
                 equity_curve.append({"date": today.name, "equity": equity})
-                continue  # skip cek confluence hari ini, udah exit duluan
+                continue
 
-        signal_result = evaluate_confluence(window, min_agree=min_agree)
+        signal_result = evaluate_confluence(window, min_agree=min_agree, use_regime_weighting=True)
         signal = signal_result["final_signal"]
 
         if position is None and signal == "BUY":
             entry_price = today["Close"] * (1 + slippage_pct)
-            position = {"entry_date": today.name, "entry_price": entry_price}
+            position = {
+                "entry_date": today.name,
+                "entry_price": entry_price,
+                "highest_price": entry_price,
+            }
             equity *= (1 - fee_pct)
 
         elif position is not None and signal == "SELL":
@@ -78,12 +98,22 @@ def run_backtest(
 
     return _summarize(trades, equity_curve)
 
-def split_train_test(data: pd.DataFrame, train_ratio: float = 0.7):
-        """Split data historis kronologis - training di awal, testing di akhir."""
-        split_idx = int(len(data) * train_ratio)
-        train_data = data.iloc[:split_idx]
-        test_data = data.iloc[split_idx:]
-        return train_data, test_data
+def split_train_test(data: pd.DataFrame, train_ratio: float = 0.7, buffer_days: int = 200):
+    """
+    Split kronologis, TAPI test_data dikasih buffer historis di depannya
+    (data sebelum split point) biar indikator long-term (EMA200) punya
+    cukup histori sejak awal window test - bukan cuma dari 0.
+
+    Trading evaluation tetap cuma dihitung mulai split_idx, tapi backtest
+    engine akan punya akses "look-back" yang cukup lewat buffer ini.
+    """
+    split_idx = int(len(data) * train_ratio)
+    train_data = data.iloc[:split_idx]
+
+    buffer_start = max(0, split_idx - buffer_days)
+    test_data_with_buffer = data.iloc[buffer_start:]
+
+    return train_data, test_data_with_buffer, split_idx - buffer_start
 
 def _summarize(trades: list, equity_curve: list) -> dict:
     if not trades:
