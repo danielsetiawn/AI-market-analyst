@@ -78,6 +78,12 @@ def run_backtest(
 
     return _summarize(trades, equity_curve)
 
+def split_train_test(data: pd.DataFrame, train_ratio: float = 0.7):
+        """Split data historis kronologis - training di awal, testing di akhir."""
+        split_idx = int(len(data) * train_ratio)
+        train_data = data.iloc[:split_idx]
+        test_data = data.iloc[split_idx:]
+        return train_data, test_data
 
 def _summarize(trades: list, equity_curve: list) -> dict:
     if not trades:
@@ -115,3 +121,5 @@ def _summarize(trades: list, equity_curve: list) -> dict:
         "sharpe_ratio": round(sharpe, 2),
         "trades": trades,
     }
+
+    
