@@ -1,70 +1,115 @@
 """
 Desk Manager Agent: gerbang validasi akhir + position sizing.
 
-Hard rule di kode (bukan cuma di prompt):
-- Kalau proposed_action == HOLD, langsung REJECTED tanpa manggil LLM
-  (gak ada yang perlu divalidasi, hemat compute).
-- position_size_pct di-cap maksimal 5% apapun kata LLM.
+Position size MAKSIMAL dihitung dari fixed fractional risk (matematika,
+berdasarkan stop-loss ATR-based aset tersebut) - bukan ditebak LLM.
+LLM cuma bisa MENGECILKAN size lebih lanjut (misal kalau reasoning-nya
+menemukan red flag tambahan), TIDAK PERNAH bisa membesarkan di atas
+hasil kalkulasi. Ini mencegah LLM confidence (yang bukan probabilitas
+statistik asli) dipakai buat menaikkan risiko.
 """
 
 from agents.base_agent import BaseAgent
+from core.position_sizing import calculate_position_size
 
-SYSTEM_PROMPT = """Kamu adalah Desk Manager Agent - pengawas risiko di sistem trading.
-Kamu menerima usulan strategi dan tugas kamu MENANTANG usulan itu,
-bukan menyetujuinya secara default.
+SYSTEM_PROMPT = """Kamu adalah Desk Manager Agent - bertugas fine-tuning position size,
+BUKAN memutuskan approve/reject (itu sudah ditentukan sebelum kamu dipanggil).
+
+Kamu menerima sinyal yang SUDAH terkonfirmasi oleh 2 validator independen
+(LLM sentiment analysis dan technical confluence), beserta batas maksimal
+position size yang sudah dihitung secara matematis (fixed fractional risk
+berdasarkan stop-loss ATR aset tersebut - volatilitas sudah diperhitungkan
+di sini).
 
 Balas HANYA dengan JSON, struktur PERSIS seperti ini:
 {
-  "status": "APPROVED" atau "REJECTED" atau "NEEDS_REVIEW",
-  "position_size_pct": <float 0.0 sampai 5.0>,
-  "reasoning": "alasan keputusan, termasuk risiko yang dipertimbangkan"
+  "size_adjustment_factor": <float 0.0 sampai 1.0>,
+  "reasoning": "alasan penyesuaian size, jika ada"
 }
 
-position_size_pct TIDAK BOLEH lebih dari 5.0 apapun alasannya."""
-
-MAX_POSITION_SIZE_PCT = 5.0
+Default 1.0 (pakai batas maksimal penuh) KECUALI kamu menemukan red flag
+SPESIFIK pada data yang diberikan (bukan kekhawatiran umum soal volatilitas
+kripto - itu sudah diperhitungkan). Jangan terlalu konservatif tanpa alasan
+konkret - sinyal ini sudah melewati validasi ketat sebelum sampai ke kamu."""
 
 
 class DeskManagerAgent(BaseAgent):
     name = "desk_manager_agent"
     system_prompt = SYSTEM_PROMPT
 
-    def run(self, strategy: dict) -> dict:
-        # Hard gate: HOLD gak usah divalidasi, langsung tolak.
+    def run(self, strategy: dict, capital: float) -> dict:
+    # Hitung batas maksimal SEBELUM tanya LLM apapun.
+        max_size_info = calculate_position_size(
+            capital=capital,
+            stop_loss_pct=strategy["stop_loss_pct"],
+            risk_per_trade_pct=0.01,
+            max_position_pct=0.25,
+        )
+
         if strategy["proposed_action"] == "HOLD":
             return {
                 "ticker": strategy["ticker"],
                 "action": "HOLD",
                 "status": "REJECTED",
-                "position_size_pct": 0.0,
+                "position_size": 0.0,
+                "position_pct_of_capital": 0.0,
                 "reasoning": "Action HOLD dari Strategy Agent - tidak ada aksi yang perlu divalidasi.",
             }
 
+    # --- Keputusan APPROVE/REJECT ditentukan oleh KODE, bukan LLM ---
+    # backtest_passed = True berarti LLM sentiment DAN technical confluence
+    # sudah sepakat (2 validator independen). Itu sudah proses validasi yang
+    # cukup ketat - LLM Desk Manager tidak diberi hak veto biner di sini,
+    # karena terbukti bisa terlalu konservatif secara inkonsisten (menolak
+    # meski 2 validator sepakat, dengan alasan generik "kripto kan volatile").
+        if not strategy["backtest_passed"]:
+            return {
+                "ticker": strategy["ticker"],
+                "action": strategy["proposed_action"],
+                "status": "REJECTED",
+                "position_size": 0.0,
+                "position_pct_of_capital": 0.0,
+                "reasoning": f"Sinyal tidak terkonfirmasi 2 validator independen. {strategy['rationale']}",
+            }
+
+    # Sampai sini, backtest_passed=True -> otomatis APPROVED.
+    # LLM cuma dipakai untuk fine-tuning position size (nuansa halus),
+    # BUKAN untuk keputusan APPROVE/REJECT.
         user_message = (
             f"Ticker: {strategy['ticker']}\n"
-            f"Proposed action: {strategy['proposed_action']}\n"
-            f"Backtest passed: {strategy['backtest_passed']}\n"
-            f"Rationale: {strategy['rationale']}"
+            f"Action (sudah terkonfirmasi 2 validator independen): {strategy['proposed_action']}\n"
+            f"Regime: {strategy['technical_regime']}\n"
+            f"Rationale: {strategy['rationale']}\n"
+            f"Batas maksimal position size (hasil kalkulasi risk management): "
+            f"{max_size_info['position_pct_of_capital']}% dari modal "
+            f"(${max_size_info['position_size']}), risiko ${max_size_info['risk_amount']} kalau stop-loss kena.\n\n"
+            "Sinyal ini SUDAH APPROVED (2 validator independen sepakat). "
+            "Tugasmu HANYA menentukan apakah perlu mengecilkan position size lebih "
+            "lanjut dari batas maksimal, berdasarkan konteks risiko spesifik yang "
+            "kamu lihat (bukan kekhawatiran umum soal volatilitas kripto - itu "
+            "sudah diperhitungkan di kalkulasi stop-loss)."
         )
 
         result = self._call_llm(user_message)
 
-        required_fields = ["status", "position_size_pct", "reasoning"]
-        for field in required_fields:
-            if field not in result:
-                raise ValueError(
-                    f"[{self.name}] Field '{field}' hilang dari output LLM: {result}"
-                )
+        if "size_adjustment_factor" not in result or "reasoning" not in result:
+            raise ValueError(
+                f"[{self.name}] Field wajib hilang dari output LLM: {result}"
+            )
 
-        # --- Hard enforcement, tidak peduli apa kata LLM ---
-        result["position_size_pct"] = min(
-            float(result["position_size_pct"]), MAX_POSITION_SIZE_PCT
-        )
-        if not strategy["backtest_passed"]:
-            result["status"] = "REJECTED"
-            result["position_size_pct"] = 0.0
-        # ----------------------------------------------------
+        adjustment = min(float(result["size_adjustment_factor"]), 1.0)
+        adjustment = max(adjustment, 0.0)
 
-        result["ticker"] = strategy["ticker"]
-        result["action"] = strategy["proposed_action"]
-        return result
+        final_position_size = max_size_info["position_size"] * adjustment
+        final_pct = max_size_info["position_pct_of_capital"] * adjustment
+
+        return {
+            "ticker": strategy["ticker"],
+            "action": strategy["proposed_action"],
+            "status": "APPROVED",
+            "position_size": round(final_position_size, 2),
+            "position_pct_of_capital": round(final_pct, 2),
+            "max_calculated_size": max_size_info["position_size"],
+            "size_adjustment_factor": adjustment,
+            "reasoning": result["reasoning"],
+        }

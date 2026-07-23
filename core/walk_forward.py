@@ -14,15 +14,8 @@ def walk_forward_validate(
     step_days: int = 60,
     buffer_days: int = 200,
     min_agree: float = 1.5,
-    stop_loss_pct: float = 0.03,
-    trailing_activation_pct: float = 0.05,
-    trailing_stop_pct: float = 0.04,
+    use_dynamic_risk: bool = True,
 ) -> list[dict]:
-    """
-    Untuk tiap window: ambil `buffer_days` data sebelum window (buat
-    indikator jangka panjang), lalu evaluasi `test_window_days` hari
-    berikutnya sebagai periode test.
-    """
     results = []
     start = buffer_days
 
@@ -39,9 +32,7 @@ def walk_forward_validate(
             window_with_buffer,
             min_agree=min_agree,
             warmup=buffer_days,
-            stop_loss_pct=stop_loss_pct,
-            trailing_activation_pct=trailing_activation_pct,
-            trailing_stop_pct=trailing_stop_pct,
+            use_dynamic_risk=use_dynamic_risk,
         )
 
         results.append({

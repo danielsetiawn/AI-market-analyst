@@ -5,7 +5,7 @@ hari per hari, tanpa lookahead bias. Fee & slippage diperhitungkan.
 
 import pandas as pd
 from core.confluence import evaluate_confluence
-
+from core.risk_sizing import calculate_dynamic_risk_params
 
 def run_backtest(
     data: pd.DataFrame,
@@ -13,21 +13,11 @@ def run_backtest(
     fee_pct: float = 0.001,
     slippage_pct: float = 0.001,
     warmup: int = 50,
-    stop_loss_pct: float = 0.03,
+    use_dynamic_risk: bool = True,
+    stop_loss_pct: float = 0.03,             # dipakai HANYA kalau use_dynamic_risk=False
     trailing_activation_pct: float = 0.05,
     trailing_stop_pct: float = 0.04,
 ) -> dict:
-    """
-    Exit logic sekarang:
-    1. Fixed stop-loss (-stop_loss_pct dari entry) - proteksi awal.
-    2. Begitu profit >= trailing_activation_pct, switch ke trailing stop:
-       exit kalau harga turun trailing_stop_pct dari titik TERTINGGI
-       yang pernah dicapai posisi ini (bukan dari entry lagi).
-       Ini yang bikin posisi bisa "ikut" rally panjang, gak kepotong
-       di target tetap kayak take-profit lama.
-    3. Confluence SELL tetap jadi exit alternatif kalau dua di atas
-       belum kena.
-    """
     position = None
     trades = []
     equity = 1.0
@@ -36,6 +26,17 @@ def run_backtest(
     for i in range(warmup, len(data)):
         window = data.iloc[: i + 1]
         today = window.iloc[-1]
+
+        # Hitung risk params: dinamis (ATR-based) atau fixed, sesuai flag
+        if use_dynamic_risk:
+            risk_params = calculate_dynamic_risk_params(window)
+            current_sl = risk_params["stop_loss_pct"]
+            current_trail_activation = risk_params["trailing_activation_pct"]
+            current_trail_stop = risk_params["trailing_stop_pct"]
+        else:
+            current_sl = stop_loss_pct
+            current_trail_activation = trailing_activation_pct
+            current_trail_stop = trailing_stop_pct
 
         if position is not None:
             current_price = today["Close"]
@@ -47,9 +48,9 @@ def run_backtest(
             change_from_peak = (current_price - position["highest_price"]) / position["highest_price"]
 
             forced_exit_reason = None
-            if change_from_entry <= -stop_loss_pct:
+            if change_from_entry <= -current_sl:
                 forced_exit_reason = "stop_loss"
-            elif change_from_entry >= trailing_activation_pct and change_from_peak <= -trailing_stop_pct:
+            elif change_from_entry >= current_trail_activation and change_from_peak <= -current_trail_stop:
                 forced_exit_reason = "trailing_stop"
 
             if forced_exit_reason:
